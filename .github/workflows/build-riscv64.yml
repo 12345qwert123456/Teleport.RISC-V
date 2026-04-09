@@ -1,0 +1,153 @@
+name: Build Teleport for RISC-V 64
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # daily at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if release exists'
+        type: boolean
+        default: false
+      version:
+        description: 'Override version (e.g. v18.7.2). Leave empty for latest.'
+        type: string
+        default: ''
+
+env:
+  IMAGE_NAME: teleport
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_USERNAME }}/teleport-riscv64
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      version_short: ${{ steps.resolve.outputs.version_short }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(curl -sL https://api.github.com/repos/gravitational/teleport/releases/latest \
+              | jq -r '.tag_name')
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_short=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          echo "Resolved Teleport version: ${VERSION}"
+
+      - name: Check if already built
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          FORCE="${{ inputs.force }}"
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Force build requested"
+            exit 0
+          fi
+
+          EXISTING=$(gh release view "${VERSION}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --json tagName -q '.tagName' 2>/dev/null || echo "")
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${VERSION}-riscv64 already exists, skipping"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "No release for ${VERSION}-riscv64, will build"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      VERSION_SHORT: ${{ needs.detect.outputs.version_short }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.teleport
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION_SHORT }}-riscv64
+          build-args: |
+            TELEPORT_VERSION=${{ env.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract and verify binaries
+        run: |
+          docker create --name extract ${{ env.IMAGE_NAME }}:${{ env.VERSION_SHORT }}-riscv64 true
+          docker cp extract:/usr/local/bin/teleport ./teleport
+          docker cp extract:/usr/local/bin/tsh ./tsh
+          docker cp extract:/usr/local/bin/tctl ./tctl
+          docker rm extract
+
+          file ./teleport
+          file ./teleport | grep -q "RISC-V" || { echo "ERROR: not a RISC-V binary"; exit 1; }
+          echo "All binaries verified as RISC-V 64-bit ELF"
+
+          tar czf teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz teleport tsh tctl
+          sha256sum teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz > SHA256SUMS
+          ls -lh teleport tsh tctl teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to Docker Hub
+        run: |
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION_SHORT }}-riscv64 \
+            ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION_SHORT }}
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION_SHORT }}-riscv64 \
+            ${{ env.DOCKERHUB_REPO }}:latest
+          docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION_SHORT }}
+          docker push ${{ env.DOCKERHUB_REPO }}:latest
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ env.VERSION }}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --title "Teleport ${{ env.VERSION_SHORT }} for RISC-V 64" \
+            --notes "Cross-compiled Teleport ${{ env.VERSION }} for linux/riscv64.
+
+          **Binaries (standalone):**
+          \`\`\`bash
+          tar xzf teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz
+          sudo install -m 755 teleport tsh tctl /usr/local/bin/
+          \`\`\`
+
+          **Docker image:**
+          \`\`\`bash
+          docker pull ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION_SHORT }}
+          \`\`\`
+
+          Built from upstream source without patches." \
+            teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz \
+            SHA256SUMS

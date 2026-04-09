@@ -1,0 +1,66 @@
+# Cross-compile Teleport for linux/riscv64
+# Build on amd64 host — no QEMU, no source patches
+# Usage: docker buildx build --build-arg TELEPORT_VERSION=v18.7.2 -t teleport:riscv64 .
+
+ARG TELEPORT_VERSION=v18.7.2
+
+# Stage 1 — Web assets (amd64: Node 24 + Rust + wasm-bindgen)
+FROM --platform=linux/amd64 node:24-alpine AS webassets_builder
+ARG TELEPORT_VERSION
+
+RUN apk add --no-cache git make bash python3 g++ curl go binaryen
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    /root/.cargo/bin/rustup target add wasm32-unknown-unknown && \
+    /root/.cargo/bin/cargo install wasm-bindgen-cli --version 0.2.99
+
+RUN npm install -g pnpm
+
+WORKDIR /teleport
+RUN git clone --depth=1 -b "${TELEPORT_VERSION}" \
+    https://github.com/gravitational/teleport.git .
+
+RUN cd web && \
+    PATH=/root/.cargo/bin:$PATH pnpm install --frozen-lockfile --silent && \
+    PATH=/root/.cargo/bin:$PATH pnpm build-ui
+
+# Stage 2 — Go cross-compile for riscv64 (amd64 host, CGO_ENABLED=1 + cross-gcc)
+FROM --platform=linux/amd64 golang:1.25 AS go_builder
+ARG TELEPORT_VERSION
+
+RUN apt-get update && apt-get install -y \
+    git gcc-riscv64-linux-gnu libc6-dev-riscv64-cross \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /teleport
+RUN git clone --depth=1 -b "${TELEPORT_VERSION}" \
+    https://github.com/gravitational/teleport.git .
+
+# Web assets from amd64 stage — no QEMU needed
+COPY --from=webassets_builder /teleport/webassets/teleport ./webassets/teleport
+
+# Cross-compile with CGO via riscv64-linux-gnu-gcc (no source patches)
+RUN CC=riscv64-linux-gnu-gcc \
+    CGO_ENABLED=1 GOOS=linux GOARCH=riscv64 \
+    go build -tags "webassets_embed" -ldflags '-w -s' -trimpath \
+        -o build/teleport ./tool/teleport && \
+    CC=riscv64-linux-gnu-gcc \
+    CGO_ENABLED=1 GOOS=linux GOARCH=riscv64 \
+    go build -ldflags '-w -s' -trimpath \
+        -o build/tsh ./tool/tsh && \
+    CC=riscv64-linux-gnu-gcc \
+    CGO_ENABLED=1 GOOS=linux GOARCH=riscv64 \
+    go build -ldflags '-w -s' -trimpath \
+        -o build/tctl ./tool/tctl
+
+# Stage 3 — Final image
+FROM ubuntu:24.04
+
+COPY --from=go_builder /teleport/build/teleport /usr/local/bin/teleport
+COPY --from=go_builder /teleport/build/tsh      /usr/local/bin/tsh
+COPY --from=go_builder /teleport/build/tctl     /usr/local/bin/tctl
+
+RUN mkdir -p /var/lib/teleport /etc/teleport
+
+EXPOSE 3025 3080 3022 3024
+ENTRYPOINT ["/usr/local/bin/teleport"]
