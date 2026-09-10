@@ -8,25 +8,30 @@ New Teleport releases are detected daily and built automatically.
 
 ## Binaries
 
+The full set of Teleport's `linux` binaries is built (same list as upstream `BINS_default`):
+
 - `teleport` — main daemon (server and agent)
 - `tsh` — CLI client
 - `tctl` — administration tool
+- `tbot` — Machine ID / Workload Identity agent
+- `teleport-update` — self-update client for managed agent upgrades
+- `fdpass-teleport` — file-descriptor passing helper for `tsh` connection resumption (Rust)
 
 ## Quick Start
 
 ### Build locally
 
 ```bash
-# Latest version
-docker buildx build -t teleport:riscv64 -f Dockerfile.teleport .
+# Default version (TELEPORT_VERSION in the Dockerfile)
+docker buildx build --platform linux/riscv64 -t teleport:riscv64 -f Dockerfile.teleport .
 
 # Specific version
-docker buildx build --build-arg TELEPORT_VERSION=v18.7.2 \
-  -t teleport:18.7.2-riscv64 -f Dockerfile.teleport .
+docker buildx build --platform linux/riscv64 --build-arg TELEPORT_VERSION=v18.10.0 \
+  -t teleport:18.10.0-riscv64 -f Dockerfile.teleport .
 ```
 
-> The build runs on an amd64 host. The image contains riscv64 binaries
-> cross-compiled with `gcc-riscv64-linux-gnu`.
+> Builder stages run natively on the build host (no QEMU). The resulting image is
+> `linux/riscv64` and contains riscv64 binaries cross-compiled with `gcc-riscv64-linux-gnu`.
 
 ### Download binaries
 
@@ -35,7 +40,7 @@ Go to the [Releases](../../releases) page, download the `.tar.gz` for your versi
 
 ```bash
 tar xzf teleport-*-linux-riscv64-bin.tar.gz
-sudo install -m 755 teleport tsh tctl /usr/local/bin/
+sudo install -m 755 teleport tsh tctl tbot teleport-update fdpass-teleport /usr/local/bin/
 ```
 
 ### Docker image
@@ -58,16 +63,25 @@ Teleport requires CGO for two packages:
 - `lib/system` — signal handling (`signal.h`)
 - `lib/shell` — user login shell lookup (`getpwnam_r` from `pwd.h`)
 
-This makes `CGO_ENABLED=0` impossible. Instead, cross-compilation is used with
-`gcc-riscv64-linux-gnu` on an amd64 host — with no patches to the Teleport source code.
+This makes `CGO_ENABLED=0` impossible for `teleport`, `tsh` and `tctl`. Instead,
+cross-compilation is used with `gcc-riscv64-linux-gnu` on an amd64 host — with no
+patches to the Teleport source code. `tbot` and `teleport-update` build as pure Go
+(`CGO_ENABLED=0`). `fdpass-teleport` is a small Rust program, cross-compiled with
+the `riscv64gc-unknown-linux-gnu` Rust target (linker: `riscv64-linux-gnu-gcc`).
 
 ### Build stages
 
 | Stage | Base image | Purpose |
 |-------|------------|---------|
-| `webassets_builder` | `node:24-alpine` (amd64) | Builds the web UI (pnpm + Rust/WASM) |
-| `go_builder` | `golang:1.25` (amd64) | Cross-compiles Go binaries for riscv64 |
-| final | `ubuntu:24.04` | Minimal runtime image |
+| `source` | `golang:1.25-trixie` (build host) | Clones Teleport once, resolves toolchain versions from it |
+| `webassets_builder` | `node:24-alpine` (build host) | Builds the web UI (pnpm + Rust/WASM) |
+| `go_builder` | `golang:1.25-trixie` (build host) | Cross-compiles the Go binaries + Rust `fdpass-teleport` for riscv64 |
+| final | `ubuntu:24.04` (riscv64) | Minimal runtime image (COPY only) |
+
+Toolchain versions are read from the Teleport source being built, so they follow upstream
+automatically: Rust from `rust-toolchain.toml` (or `build.assets/versions.mk` on older tags),
+`wasm-bindgen-cli` from `Cargo.lock`, `wasm-opt` from `versions.mk`, pnpm from
+`package.json` `packageManager`.
 
 ### Key environment variables
 
@@ -83,8 +97,8 @@ The GitHub Actions workflow (`.github/workflows/build-riscv64.yml`):
 - Runs daily at 06:00 UTC (and on manual trigger)
 - Fetches the latest Teleport release version from the GitHub API
 - Checks if a riscv64 release already exists — skips if it does
-- Builds the image with Docker BuildKit and GHA layer cache
-- Verifies the binary is a genuine RISC-V ELF
+- Builds the `linux/riscv64` image with Docker BuildKit (no QEMU)
+- Verifies every extracted binary is a genuine RISC-V ELF
 - Publishes standalone binaries (`.tar.gz` + SHA256) as a GitHub Release
 - Pushes the Docker image to Docker Hub
 
@@ -108,10 +122,12 @@ Force a rebuild or build a specific version via `workflow_dispatch`.
 | Component | Version |
 |-----------|---------|
 | Teleport | latest (auto-detected) |
-| Go | 1.25 |
+| Go | 1.25 (`golang:1.25-trixie`, `GOTOOLCHAIN=auto` follows `go.mod`) |
+| Rust | from upstream (target `riscv64gc-unknown-linux-gnu`) |
 | GCC cross | 14.2.0 (riscv64-linux-gnu) |
 | Node.js | 24 |
-| wasm-bindgen | 0.2.99 |
+| pnpm | from upstream `packageManager` |
+| wasm-bindgen / wasm-opt | from upstream `Cargo.lock` / `versions.mk` |
 
 ## License
 

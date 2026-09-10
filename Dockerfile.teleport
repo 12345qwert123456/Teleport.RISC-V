@@ -1,32 +1,80 @@
+# check=skip=FromPlatformFlagConstDisallowed
 # Cross-compile Teleport for linux/riscv64
-# Build on amd64 host — no QEMU, no source patches
-# Usage: docker buildx build --build-arg TELEPORT_VERSION=v18.7.2 -t teleport:riscv64 .
+# Builder stages run natively on the build host — no QEMU, no source patches
+# Usage: docker buildx build --platform linux/riscv64 --build-arg TELEPORT_VERSION=v18.10.0 \
+#          -t teleport:riscv64 -f Dockerfile.teleport .
 
-ARG TELEPORT_VERSION=v18.7.2
+ARG TELEPORT_VERSION=v18.10.0
 
-# Stage 1 — Web assets (amd64: Node 24 + Rust + wasm-bindgen)
-FROM --platform=linux/amd64 node:24-alpine AS webassets_builder
+# Stage 0 — Upstream source (cloned once) + toolchain versions resolved from it
+FROM --platform=$BUILDPLATFORM golang:1.25-trixie AS source
 ARG TELEPORT_VERSION
-
-RUN apk add --no-cache git make bash python3 g++ curl go binaryen
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    /root/.cargo/bin/rustup target add wasm32-unknown-unknown && \
-    /root/.cargo/bin/cargo install wasm-bindgen-cli --version 0.2.99
-
-RUN npm install -g pnpm
 
 WORKDIR /teleport
 RUN git clone --depth=1 -b "${TELEPORT_VERSION}" \
     https://github.com/gravitational/teleport.git .
 
-RUN cd web && \
-    PATH=/root/.cargo/bin:$PATH pnpm install --frozen-lockfile --silent && \
-    PATH=/root/.cargo/bin:$PATH pnpm build-ui
+# One file per version: stages COPY only what they need, and COPY is content-hashed,
+# so toolchain layers stay cached until upstream actually bumps that version.
+#   rust         — rust-toolchain.toml (v18.10+) or build.assets/versions.mk (older)
+#   wasm_bindgen — Cargo.lock (same awk as upstream Makefile; CLI must match exactly)
+#   wasm_opt     — build.assets/versions.mk
+#   pnpm         — package.json "packageManager"
+RUN set -eu; mkdir -p /versions; \
+    rust=$(awk -F'"' '$1 ~ /^channel *=/ {print $2; exit}' rust-toolchain.toml 2>/dev/null || true); \
+    [ -n "$rust" ] || rust=$(sed -n 's/^RUST_VERSION *?= *\([0-9.]*\).*/\1/p' build.assets/versions.mk); \
+    wasm_bindgen=$(awk '$1 == "name" && $3 == "\"wasm-bindgen\"" {in_pkg=1; next} \
+        in_pkg && $1 == "version" {gsub(/"/, "", $3); print $3; exit}' Cargo.lock); \
+    wasm_opt=$(sed -n 's/^WASM_OPT_VERSION *?= *\([0-9.]*\).*/\1/p' build.assets/versions.mk); \
+    pnpm=$(sed -n 's/.*"packageManager": *"pnpm@\([0-9.]*\).*/\1/p' package.json); \
+    for v in "rust=$rust" "wasm_bindgen=$wasm_bindgen" "wasm_opt=$wasm_opt" "pnpm=$pnpm"; do \
+        name=${v%%=*}; val=${v#*=}; \
+        [ -n "$val" ] || { echo "ERROR: cannot resolve $name version" >&2; exit 1; }; \
+        echo "$val" > "/versions/$name"; echo "$v"; \
+    done
 
-# Stage 2 — Go cross-compile for riscv64 (amd64 host, CGO_ENABLED=1 + cross-gcc)
-FROM --platform=linux/amd64 golang:1.25 AS go_builder
-ARG TELEPORT_VERSION
+# Stage 1 — Web assets (Node 24 + Rust/WASM)
+FROM --platform=$BUILDPLATFORM node:24-alpine AS webassets_builder
+
+RUN apk add --no-cache git make bash python3 g++ curl go
+
+ENV PATH=/root/.cargo/bin:$PATH
+
+COPY --from=source /versions/rust /versions/rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain "$(cat /versions/rust)" \
+        --target wasm32-unknown-unknown
+
+# Same tools and toolchain as `make ensure-wasm-bindgen` / `ensure-wasm-opt`,
+# so those steps become no-ops during the UI build
+COPY --from=source /versions/wasm_bindgen /versions/wasm_opt /versions/
+RUN export RUSTUP_TOOLCHAIN="$(cat /versions/rust)" && \
+    cargo install --locked wasm-bindgen-cli --version "$(cat /versions/wasm_bindgen)" && \
+    cargo install --locked "wasm-opt@$(cat /versions/wasm_opt)"
+
+COPY --from=source /versions/pnpm /versions/pnpm
+RUN npm install -g "pnpm@$(cat /versions/pnpm)"
+
+COPY --from=source /teleport /teleport
+WORKDIR /teleport
+
+# Newer tags gitignore the logo SVGs; `make ensure-webassets` stages them before the
+# Vite build (AGPL variant outside gravitational CI). Mirror it where the Makefile does.
+RUN if grep -q 'public/app/logo-light.svg' Makefile; then \
+        for v in light dark; do \
+            cp "web/packages/design/src/assets/images/agpl-$v.svg" \
+               "web/packages/teleport/public/app/logo-$v.svg"; \
+        done; \
+    fi
+
+# Workspace root is the repo root; build-ui-oss skips the private enterprise UI (e/)
+RUN export RUSTUP_TOOLCHAIN="$(cat /versions/rust)" && \
+    pnpm install --frozen-lockfile && \
+    pnpm build-ui-oss
+
+# Stage 2 — Go + Rust cross-compile for riscv64 (CGO_ENABLED=1 + cross-gcc)
+# trixie: bookworm has no riscv64 architecture packages (libpam0g-dev:riscv64)
+FROM --platform=$BUILDPLATFORM golang:1.25-trixie AS go_builder
 
 RUN dpkg --add-architecture riscv64 && \
     apt-get update && apt-get install -y \
@@ -34,35 +82,71 @@ RUN dpkg --add-architecture riscv64 && \
     libpam0g-dev:riscv64 \
     && rm -rf /var/lib/apt/lists/*
 
+# Follow go.mod: if upstream bumps the go directive past the image's Go, fetch that toolchain
+ENV GOTOOLCHAIN=auto
+
+# Rust toolchain for fdpass-teleport (cross-compiled to riscv64gc-unknown-linux-gnu)
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc
+COPY --from=source /versions/rust /versions/rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain "$(cat /versions/rust)" \
+        --target riscv64gc-unknown-linux-gnu
+
+COPY --from=source /teleport /teleport
 WORKDIR /teleport
-RUN git clone --depth=1 -b "${TELEPORT_VERSION}" \
-    https://github.com/gravitational/teleport.git .
 
-# Web assets from amd64 stage — no QEMU needed
-COPY --from=webassets_builder /teleport/webassets/teleport ./webassets/teleport
-
-# Cross-compile with CGO via riscv64-linux-gnu-gcc (no source patches)
+# Binaries that don't embed the web UI — built while stage 1 is still running:
+#   tsh / tctl              -> CGO via riscv64-linux-gnu-gcc (signal + login-shell lookup)
+#   tbot / teleport-update  -> pure Go, CGO not required upstream
 RUN CC=riscv64-linux-gnu-gcc \
     CGO_ENABLED=1 GOOS=linux GOARCH=riscv64 \
-    go build -tags "webassets_embed pam" -ldflags '-w -s' -trimpath \
-        -o build/teleport ./tool/teleport && \
-    CC=riscv64-linux-gnu-gcc \
-    CGO_ENABLED=1 GOOS=linux GOARCH=riscv64 \
-    go build -ldflags '-w -s' -trimpath \
+    go build -tags "kustomize_disable_go_plugin_support" -ldflags '-w -s' -trimpath \
         -o build/tsh ./tool/tsh && \
     CC=riscv64-linux-gnu-gcc \
     CGO_ENABLED=1 GOOS=linux GOARCH=riscv64 \
+    go build -tags "kustomize_disable_go_plugin_support" -ldflags '-w -s' -trimpath \
+        -o build/tctl ./tool/tctl && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=riscv64 \
+    go build -tags "kustomize_disable_go_plugin_support" -ldflags '-w -s' -trimpath \
+        -o build/tbot ./tool/tbot && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=riscv64 \
     go build -ldflags '-w -s' -trimpath \
-        -o build/tctl ./tool/tctl
+        -o build/teleport-update ./tool/teleport-update
 
-# Stage 3 — Final image
-FROM ubuntu:24.04
+# Rust — fdpass-teleport (connection-resumption fd-passing helper).
+# RUSTUP_TOOLCHAIN overrides the repo's rust-toolchain.toml, whose targets lack riscv64.
+RUN cd tool/fdpass-teleport && \
+    RUSTUP_TOOLCHAIN="$(cat /versions/rust)" \
+    cargo build --release --locked --target riscv64gc-unknown-linux-gnu && \
+    cp target/riscv64gc-unknown-linux-gnu/release/fdpass-teleport \
+        /teleport/build/fdpass-teleport
 
-COPY --from=go_builder /teleport/build/teleport /usr/local/bin/teleport
-COPY --from=go_builder /teleport/build/tsh      /usr/local/bin/tsh
-COPY --from=go_builder /teleport/build/tctl     /usr/local/bin/tctl
+# Web assets from stage 1 — only teleport embeds them
+COPY --from=webassets_builder /teleport/webassets/teleport ./webassets/teleport
 
-RUN mkdir -p /var/lib/teleport /etc/teleport
+RUN CC=riscv64-linux-gnu-gcc \
+    CGO_ENABLED=1 GOOS=linux GOARCH=riscv64 \
+    go build -tags "webassets_embed pam kustomize_disable_go_plugin_support" \
+        -ldflags '-w -s' -trimpath \
+        -o build/teleport ./tool/teleport
+
+# Arch-independent runtime files, so the final stage needs no RUN
+RUN mkdir -p /rootfs/etc/teleport /rootfs/var/lib/teleport /rootfs/etc/ssl/certs && \
+    cp /etc/ssl/certs/ca-certificates.crt /rootfs/etc/ssl/certs/
+
+# Stage 3 — Final image: riscv64 userland, COPY only (no RUN → no QEMU)
+FROM --platform=linux/riscv64 ubuntu:24.04
+
+COPY --from=go_builder /rootfs/ /
+COPY --from=go_builder /teleport/build/teleport        /usr/local/bin/teleport
+COPY --from=go_builder /teleport/build/tsh             /usr/local/bin/tsh
+COPY --from=go_builder /teleport/build/tctl            /usr/local/bin/tctl
+COPY --from=go_builder /teleport/build/tbot            /usr/local/bin/tbot
+COPY --from=go_builder /teleport/build/teleport-update /usr/local/bin/teleport-update
+COPY --from=go_builder /teleport/build/fdpass-teleport /usr/local/bin/fdpass-teleport
 
 EXPOSE 3025 3080 3022 3024
 ENTRYPOINT ["/usr/local/bin/teleport"]

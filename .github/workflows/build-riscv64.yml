@@ -89,29 +89,34 @@ jobs:
         with:
           context: .
           file: Dockerfile.teleport
-          platforms: linux/amd64
+          # Builder stages run natively on the runner; only the final image is riscv64 (no QEMU).
+          # No layer cache: exporting it took ~11 min and entries are evicted (7 days unused)
+          # long before the next Teleport release.
+          platforms: linux/riscv64
           load: true
           tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION_SHORT }}-riscv64
           build-args: |
             TELEPORT_VERSION=${{ env.VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Extract and verify binaries
+        env:
+          BINS: teleport tsh tctl tbot teleport-update fdpass-teleport
         run: |
-          docker create --name extract ${{ env.IMAGE_NAME }}:${{ env.VERSION_SHORT }}-riscv64 true
-          docker cp extract:/usr/local/bin/teleport ./teleport
-          docker cp extract:/usr/local/bin/tsh ./tsh
-          docker cp extract:/usr/local/bin/tctl ./tctl
+          docker create --platform linux/riscv64 --name extract ${{ env.IMAGE_NAME }}:${{ env.VERSION_SHORT }}-riscv64 true
+          for b in $BINS; do
+            docker cp "extract:/usr/local/bin/$b" "./$b"
+          done
           docker rm extract
 
-          file ./teleport
-          file ./teleport | grep -q "RISC-V" || { echo "ERROR: not a RISC-V binary"; exit 1; }
+          for b in $BINS; do
+            file "./$b"
+            file "./$b" | grep -q "RISC-V" || { echo "ERROR: $b is not a RISC-V binary"; exit 1; }
+          done
           echo "All binaries verified as RISC-V 64-bit ELF"
 
-          tar czf teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz teleport tsh tctl
+          tar czf teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz $BINS
           sha256sum teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz > SHA256SUMS
-          ls -lh teleport tsh tctl teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz
+          ls -lh $BINS teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -137,10 +142,10 @@ jobs:
             --title "Teleport ${{ env.VERSION_SHORT }} for RISC-V 64" \
             --notes "Cross-compiled Teleport ${{ env.VERSION }} for linux/riscv64.
 
-          **Binaries (standalone):**
+          **Binaries (standalone):** \`teleport\`, \`tsh\`, \`tctl\`, \`tbot\`, \`teleport-update\`, \`fdpass-teleport\`
           \`\`\`bash
           tar xzf teleport-${{ env.VERSION_SHORT }}-linux-riscv64-bin.tar.gz
-          sudo install -m 755 teleport tsh tctl /usr/local/bin/
+          sudo install -m 755 teleport tsh tctl tbot teleport-update fdpass-teleport /usr/local/bin/
           \`\`\`
 
           **Docker image:**
