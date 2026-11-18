@@ -36,7 +36,7 @@ RUN set -eu; mkdir -p /versions; \
 # Stage 1 — Web assets (Node 24 + Rust/WASM)
 FROM --platform=$BUILDPLATFORM node:24-alpine AS webassets_builder
 
-RUN apk add --no-cache git make bash python3 g++ curl go
+RUN apk add --no-cache git make bash python3 g++ clang curl go
 
 ENV PATH=/root/.cargo/bin:$PATH
 
